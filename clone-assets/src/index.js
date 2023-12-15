@@ -50,13 +50,13 @@ export default class Migration {
       fs.rmSync('./temp', { recursive: true, force: true });
       fs.mkdirSync('./temp')
       await this.getTargetSpaceToken()
-      // await this.getStories()
+      await this.getStories()
       await this.getAssetsFolders()
       await this.createAssetsFolders()
       await this.getAssets()
       await this.uploadAssets()
-      // this.replaceAssetsInStories()
-      // await this.saveStories()
+      this.replaceAssetsInStories()
+      await this.saveStories()
     } catch (err) {
       console.log(`${chalk.white.bgRed(` ⚠ Migration Error `)} ${chalk.red(err.toString().replace('Error: ', ''))}`)
     }
