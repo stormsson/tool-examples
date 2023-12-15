@@ -30,7 +30,7 @@ export default class Migration {
   stepMessage(index, text, append_text) {
     process.stdout.clearLine()
     process.stdout.cursorTo(0)
-    process.stdout.write(`${chalk.white.bgBlue(` ${index}/5 `)} ${text} ${append_text ? chalk.black.bgYellow(` ${append_text} `) : ''}`)
+    process.stdout.write(`${chalk.white.bgBlue(` ${index}/7 `)} ${text} ${append_text ? chalk.black.bgYellow(` ${append_text} `) : ''}`)
   }
 
   /**
@@ -39,7 +39,7 @@ export default class Migration {
   stepMessageEnd(index, text) {
     process.stdout.clearLine()
     process.stdout.cursorTo(0)
-    process.stdout.write(`${chalk.black.bgGreen(` ${index}/5 `)} ${text}\n`)
+    process.stdout.write(`${chalk.black.bgGreen(` ${index}/7 `)} ${text}\n`)
   }
 
   /**
@@ -50,11 +50,13 @@ export default class Migration {
       fs.rmSync('./temp', { recursive: true, force: true });
       fs.mkdirSync('./temp')
       await this.getTargetSpaceToken()
-      await this.getStories()
+      // await this.getStories()
+      await this.getAssetsFolders()
+      await this.createAssetsFolders()
       await this.getAssets()
       await this.uploadAssets()
-      this.replaceAssetsInStories()
-      await this.saveStories()
+      // this.replaceAssetsInStories()
+      // await this.saveStories()
     } catch (err) {
       console.log(`${chalk.white.bgRed(` ⚠ Migration Error `)} ${chalk.red(err.toString().replace('Error: ', ''))}`)
     }
@@ -130,11 +132,119 @@ export default class Migration {
     }
   }
 
+/**
+   * Get the Assets folders from the source space
+   */
+async getAssetsFolders() {
+  this.stepMessage('2', `Fetching assets folders from source space.`)
+  try {
+    const assets_folders_page_request = await this.storyblok.get(`spaces/${this.source_space_id}/asset_folders`, {
+      per_page: 100,
+      page: 1
+    })
+
+    this.source_assets_folders_list = assets_folders_page_request.data.asset_folders
+    this.stepMessageEnd('2', `Fetched assets folders from source space.`)
+  } catch (err) {
+    this.migrationError('Error fetching the assets. ')
+  }
+}
+
+
+
+/**
+ * 
+ * support function  to create a breadth first list of the folder structure.
+ *
+ */
+_generateTreeFromFolderList() {
+  let parentMap = new Map();
+
+
+  this.source_assets_folders_list.forEach(folder => {
+      if (!parentMap.has(folder.parent_id)) {
+          parentMap.set(folder.parent_id, []);
+      }
+      parentMap.get(folder.parent_id).push(folder);
+  });
+
+  // 0 is the default root parent id 
+  let first_level_folders = this.source_assets_folders_list.filter(folder => folder.parent_id === 0);
+
+  // Queue for breadth-first traversal
+  let queue = [...first_level_folders];
+  let sortedNodes = [];
+
+  // Perform breadth-first traversal
+  while (queue.length > 0) {
+      let currentNode = queue.shift();
+      sortedNodes.push(currentNode);
+
+      let children = parentMap.get(currentNode.id) || [];
+      queue.push(...children);
+  }
+
+  return sortedNodes;
+}
+
+/**
+ * Clone the Assets folder structure from the source space in the destination space.
+ * Folders must be created in hierarchical order to avoid referencing a parent that still doesn't exist.
+ * Furthermore we save this.asset_folders_id_mapping acting as a mapping from old_id to new_id to be used in the 
+ * asset positioning in the asset upload phase so that they'll reference the new ids instead of the old ones
+ * 
+ */
+
+async createAssetsFolders() {
+  this.stepMessage('3', `Creating asset folder structure in destination space.`)
+  let total = 0
+
+  // 0 is the default root folder id
+  this.asset_folders_id_mapping = {
+    0:0
+  }
+  
+  const breadth_first_folders =  this._generateTreeFromFolderList()
+
+  return new Promise((resolve) => {
+    let total = 0
+
+    // must be sequential or children won't have reference to parent id
+    async.eachSeries(breadth_first_folders, async (f) => {
+      
+      const old_id = f['id']
+      delete(f['parent_uuid'])
+      delete(f['uuid'])
+      delete(f['id'])
+      if (this.asset_folders_id_mapping[f['parent_id']] !== undefined) {
+        f['parent_id'] = this.asset_folders_id_mapping[f['parent_id']]
+      }
+
+      try {
+        const resp = await this.storyblok.post(`spaces/${this.target_space_id}/asset_folders/`, {
+          asset_folder: f
+        })
+        this.asset_folders_id_mapping[old_id] = resp.data.asset_folder.id
+        this.stepMessage('3', ``, `${++total} of ${this.source_assets_folders_list.length} folders created.`)
+      } catch (error) {
+        console.log("ERROR ",error, f, this.asset_folders_id_mapping)
+        this.migrationError("An error occurred while creating the folders")
+      }
+      
+    }, () => {
+      process.stdout.clearLine()
+      this.stepMessageEnd('3', `created folders in target space.`)
+      resolve()
+    })
+  })
+
+}
+
   /**
    * Get the Assets list from the source space
    */
   async getAssets() {
-    this.stepMessage('2', `Fetching assets from source space.`)
+    this.stepMessage('4', `Fetching assets from source space.`)
     try {
       const assets_page_request = await this.storyblok.get(`spaces/${this.source_space_id}/assets`, {
         per_page: 100,
@@ -151,8 +261,12 @@ export default class Migration {
         )
       }
       const assets_responses = await Promise.all(assets_requests)
-      this.assets_list = assets_responses.map(r => r.data.assets).flat().map((asset) => asset.filename)
-      this.stepMessageEnd('2', `Fetched assets from source space.`)
+      this.assets_list = assets_responses.map(r => r.data.assets).flat().map((asset) => {
+        return { filename: asset.filename, asset_folder_id: asset.asset_folder_id }
+      })
+
+
+      this.stepMessageEnd('4', `Fetched assets from source space.`)
     } catch (err) {
       this.migrationError('Error fetching the assets. Please double check the source space id.')
     }
@@ -162,16 +276,18 @@ export default class Migration {
    * Upload Assets to the target space
    */
   async uploadAssets() {
-    this.stepMessage('3', ``, `0 of ${this.assets_list.length} assets uploaded`)
+    this.stepMessage('5', ``, `0 of ${this.assets_list.length} assets uploaded`)
     this.assets = []
 
     return new Promise((resolve) => {
       let total = 0
       async.eachLimit(this.assets_list, this.simultaneous_uploads, async (asset) => {
-        const asset_url = asset.replace('s3.amazonaws.com/', '')
-        this.assets.push({ original_url: asset_url })
-        await this.uploadAsset(asset_url)
-        this.stepMessage('3', ``, `${++total} of ${this.assets_list.length} assets uploaded`)
+        const asset_url = asset.filename.replace('s3.amazonaws.com/', '')
+        this.assets.push({ original_url: asset_url, original_asset_folder_id: asset.asset_folder_id })
+        const target_folder_id = this.asset_folders_id_mapping[asset.asset_folder_id] ?? null        
+        
+        await this.uploadAsset(asset_url, target_folder_id)
+        this.stepMessage('', ``, `${++total} of ${this.assets_list.length} assets uploaded`)
       }, () => {
         process.stdout.clearLine()
         this.stepMessageEnd('3', `Uploaded assets to target space.`)
@@ -219,12 +335,17 @@ export default class Migration {
 
   /**
    * Upload a single Asset to the space
+   * @param asset: original url of the asset
+   * @param target_folder_id: destination folder of the asset 0 = root
    */
-  async uploadAsset(asset) {
+  async uploadAsset(asset, target_folder_id=0) {
     const asset_data = this.getAssetData(asset)
+
+
+    console.log("Uploading ", asset, "to folder", target_folder_id)
     try {
       await this.downloadAsset(asset)
-      let new_asset_payload = { filename: asset_data.filename, size: asset_data.dimensions }
+      let new_asset_payload = { filename: asset_data.filename, size: asset_data.dimensions, asset_folder_id:target_folder_id }
       const new_asset_request = await this.storyblok.post(`spaces/${this.target_space_id}/assets`, new_asset_payload)
       if (new_asset_request.status != 200) {
         return resolve({ success: false })
@@ -267,7 +388,7 @@ export default class Migration {
           } else {
             ++this.assets_retries[asset]
           }
-          return this.uploadAsset(asset)
+          return this.uploadAsset(asset, target_folder_id)
         }
       } else {
         return { success: false }
@@ -279,7 +400,7 @@ export default class Migration {
    * Replace the new urls in the target space stories
    */
   replaceAssetsInStories() {
-    this.stepMessage('4', ``, `0 of ${this.assets.length} URLs replaced`)
+    this.stepMessage('6', ``, `0 of ${this.assets.length} URLs replaced`)
     this.updated_stories = this.stories_list.slice(0)
     this.assets.forEach((asset, index) => {
       const asset_url_reg = new RegExp(asset.original_url.replace('https:', '').replace('http:', ''), 'g')
@@ -289,9 +410,9 @@ export default class Migration {
       } else {
         this.updated_stories = JSON.parse(JSON.stringify(this.updated_stories).replace(asset_url_reg, ''))
       }
-      this.stepMessage('4', ``, `${index} of ${this.assets.length} URLs replaced`)
+      this.stepMessage('6', ``, `${index} of ${this.assets.length} URLs replaced`)
     })
-    this.stepMessageEnd('4', `Replaced all URLs in the stories.`)
+    this.stepMessageEnd('6', `Replaced all URLs in the stories.`)
   }
 
   /**
@@ -313,14 +434,14 @@ export default class Migration {
       }
       try {
         await this.storyblok.put(`spaces/${this.target_space_id}/stories/${story.id}`, post_data)
-        this.stepMessage('5', ``, `${++total} of ${stories_with_updates.length} stories updated.`)
+        this.stepMessage('7', ``, `${++total} of ${stories_with_updates.length} stories updated.`)
         return true
       } catch(err) {
         return false
       }
     }))
     process.stdout.clearLine()
-    this.stepMessageEnd('5', `Updated stories in target space.`)
+    this.stepMessageEnd('7', `Updated stories in target space.`)
     console.log(chalk.black.bgGreen(' ✓ Completed '), `${migration_result.filter(r => r.status === 'fulfilled' && r.value).length} ${migration_result.filter(r => r.status === 'fulfilled' && r.value).length === 1 ? 'story' : 'stories'} updated.`)
   }
 }
